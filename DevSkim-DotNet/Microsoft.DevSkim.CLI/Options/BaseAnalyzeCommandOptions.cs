@@ -76,4 +76,7 @@ public record BaseAnalyzeCommandOptions : LogOptions
 
     [Option("skip-excerpts", HelpText = "Set to skip gathering excerpts and samples to include in the report.", Default = false)]
     public bool SkipExcerpts { get; set; }
+
+    [Option("disable-progress", Required = false, HelpText = "Disable progress bar display", Default = false)]
+    public bool DisableProgress { get; set; }
 }

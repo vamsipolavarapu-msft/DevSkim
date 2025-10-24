@@ -17,6 +17,7 @@ using LibGit2Sharp;
 using Microsoft.ApplicationInspector.RulesEngine;
 using Microsoft.DevSkim.CLI.Options;
 using Microsoft.Extensions.Logging;
+using ShellProgressBar;
 
 namespace Microsoft.DevSkim.CLI.Commands
 {
@@ -63,72 +64,8 @@ namespace Microsoft.DevSkim.CLI.Commands
                 return (int)ExitCode.CriticalError;
             }
 
-            IEnumerable<FileEntry> fileListing;
-            Extractor extractor = new Extractor();
-            ExtractorOptions extractorOpts = new ExtractorOptions() { ExtractSelfOnFail = false, AllowFilters = _opts.AllowGlobs, DenyFilters = _opts.Globs };
-            // Analysing a single file
-            if (!Directory.Exists(fullPath))
-            {
-                if (_opts.RespectGitIgnore)
-                {
-                    if (IsGitPresent())
-                    {
-                        if (IsGitIgnored(fullPath))
-                        {
-                            _logger.LogError("The file specified was ignored by gitignore.");
-                            return (int)ExitCode.CriticalError;
-                        }
-
-                        fileListing = FilePathToFileEntries(_opts, fullPath, extractor, extractorOpts);
-                    }
-                    else
-                    {
-                        _logger.LogError("Could not detect git on path. Unable to use gitignore.");
-                        return (int)ExitCode.CriticalError;
-                    }
-                }
-                else
-                {
-                    fileListing = FilePathToFileEntries(_opts, fullPath, extractor, extractorOpts);
-                }
-            }
-            // Analyzing a directory
-            else
-            {
-                if (_opts.RespectGitIgnore)
-                {
-                    if (IsGitPresent())
-                    {
-                        List<FileEntry> innerList = new List<FileEntry>();
-                        IEnumerable<string> files = Directory.EnumerateFiles(fullPath, "*.*", SearchOption.AllDirectories)
-                            .Where(fileName => !IsGitIgnored(fileName));
-                        foreach (string? notIgnoredFileName in files)
-                        {
-                            innerList.AddRange(
-                                FilePathToFileEntries(_opts, notIgnoredFileName, extractor, extractorOpts));
-                        }
-
-                        fileListing = innerList;
-                    }
-                    else
-                    {
-                        _logger.LogError("Could not detect git on path. Unable to use gitignore.");
-                        return (int)ExitCode.CriticalError;
-                    }
-                }
-                else
-                {
-                    List<FileEntry> innerList = new List<FileEntry>();
-                    IEnumerable<string> files = Directory.EnumerateFiles(fullPath, "*.*", SearchOption.AllDirectories);
-                    foreach (string file in files)
-                    {
-                        innerList.AddRange(FilePathToFileEntries(_opts, file, extractor, extractorOpts));
-                    }
-
-                    fileListing = innerList;
-                }
-            }
-            return RunFileEntries(fileListing, languages);
+            // Pass the path and let RunFileEntries handle file discovery with progress
+            return RunFileEntries(fullPath, languages);
         }
 
         /// <summary>
@@ -313,15 +250,284 @@ namespace Microsoft.DevSkim.CLI.Commands
             return childPath;
         }
 
-        private int RunFileEntries(IEnumerable<FileEntry> fileListing, Languages devSkimLanguages)
+        private int RunFileEntries(string scanPath, Languages devSkimLanguages)
         {
-            DevSkimRuleSet devSkimRuleSet = _opts.IgnoreDefaultRules ? new() : DevSkimRuleSet.GetDefaultRuleSet();
-            if (_opts.Rules.Any())
+            // Progress bar options
+            var progressBarOptions = new ProgressBarOptions
             {
-                foreach (string path in _opts.Rules)
+                ForegroundColor = ConsoleColor.Yellow,
+                ForegroundColorDone = ConsoleColor.DarkGreen,
+                BackgroundColor = ConsoleColor.DarkGray,
+                BackgroundCharacter = '\u2593',
+                DisableBottomPercentage = false,
+                ShowEstimatedDuration = true
+            };
+
+            // Step 1: Discover files with progress bar
+            List<FileEntry> fileList;
+            Extractor extractor = new Extractor();
+            ExtractorOptions extractorOpts = new ExtractorOptions() 
+            { 
+                ExtractSelfOnFail = false, 
+                AllowFilters = _opts.AllowGlobs, 
+                DenyFilters = _opts.Globs 
+            };
+
+            if (!_opts.DisableProgress)
+            {
+                // For large repos, we don't know the total count ahead of time
+                // So we'll use an indeterminate progress bar or estimated count
+                using (var discoveryProgressBar = new ProgressBar(100, "Discovering files", progressBarOptions))
                 {
-                    devSkimRuleSet.AddPath(path);
+                    fileList = new List<FileEntry>();
+                    
+                    // Analysing a single file
+                    if (!Directory.Exists(scanPath))
+                    {
+                        discoveryProgressBar.Tick(50, "Checking file...");
+                        
+                        if (_opts.RespectGitIgnore)
+                        {
+                            if (IsGitPresent())
+                            {
+                                if (IsGitIgnored(scanPath))
+                                {
+                                    _logger.LogError("The file specified was ignored by gitignore.");
+                                    return (int)ExitCode.CriticalError;
+                                }
+
+                                fileList.AddRange(FilePathToFileEntries(_opts, scanPath, extractor, extractorOpts));
+                            }
+                            else
+                            {
+                                _logger.LogError("Could not detect git on path. Unable to use gitignore.");
+                                return (int)ExitCode.CriticalError;
+                            }
+                        }
+                        else
+                        {
+                            fileList.AddRange(FilePathToFileEntries(_opts, scanPath, extractor, extractorOpts));
+                        }
+                        
+                        discoveryProgressBar.Tick(100, $"Found {fileList.Count} file(s)");
+                    }
+                    // Analyzing a directory
+                    else
+                    {
+                        discoveryProgressBar.Tick(10, "Scanning directory structure...");
+                        
+                        if (_opts.RespectGitIgnore)
+                        {
+                            if (IsGitPresent())
+                            {
+                                IEnumerable<string> files = Directory.EnumerateFiles(scanPath, "*.*", SearchOption.AllDirectories);
+                                var fileArray = files.ToArray(); // Materialize to get count
+                                int discoveredFiles = fileArray.Length;
+                                int processedFiles = 0;
+                                
+                                discoveryProgressBar.Tick(30, $"Found {discoveredFiles} files, checking gitignore...");
+
+                                foreach (string file in fileArray)
+                                {
+                                    if (!IsGitIgnored(file))
+                                    {
+                                        fileList.AddRange(FilePathToFileEntries(_opts, file, extractor, extractorOpts));
+                                    }
+                                    
+                                    processedFiles++;
+                                    if (processedFiles % 100 == 0 || processedFiles == discoveredFiles)
+                                    {
+                                        int progress = 30 + (int)((double)processedFiles / discoveredFiles * 70);
+                                        discoveryProgressBar.Tick(progress, 
+                                            $"Processed {processedFiles}/{discoveredFiles} files, found {fileList.Count} to analyze");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                _logger.LogError("Could not detect git on path. Unable to use gitignore.");
+                                return (int)ExitCode.CriticalError;
+                            }
+                        }
+                        else
+                        {
+                            IEnumerable<string> files = Directory.EnumerateFiles(scanPath, "*.*", SearchOption.AllDirectories);
+                            var fileArray = files.ToArray();
+                            int discoveredFiles = fileArray.Length;
+                            int processedFiles = 0;
+                            
+                            discoveryProgressBar.Tick(30, $"Found {discoveredFiles} files...");
+
+                            foreach (string file in fileArray)
+                            {
+                                fileList.AddRange(FilePathToFileEntries(_opts, file, extractor, extractorOpts));
+                                
+                                processedFiles++;
+                                if (processedFiles % 100 == 0 || processedFiles == discoveredFiles)
+                                {
+                                    int progress = 30 + (int)((double)processedFiles / discoveredFiles * 70);
+                                    discoveryProgressBar.Tick(progress, 
+                                        $"Processed {processedFiles}/{discoveredFiles} files");
+                                }
+                            }
+                        }
+                        
+                        discoveryProgressBar.Tick(100, $"Discovered {fileList.Count} files to analyze");
+                    }
                 }
+            }
+            else
+            {
+                // No progress bar - original logic
+                fileList = new List<FileEntry>();
+                
+                if (!Directory.Exists(scanPath))
+                {
+                    if (_opts.RespectGitIgnore)
+                    {
+                        if (IsGitPresent())
+                        {
+                            if (IsGitIgnored(scanPath))
+                            {
+                                _logger.LogError("The file specified was ignored by gitignore.");
+                                return (int)ExitCode.CriticalError;
+                            }
+
+                            fileList.AddRange(FilePathToFileEntries(_opts, scanPath, extractor, extractorOpts));
+                        }
+                        else
+                        {
+                            _logger.LogError("Could not detect git on path. Unable to use gitignore.");
+                            return (int)ExitCode.CriticalError;
+                        }
+                    }
+                    else
+                    {
+                        fileList.AddRange(FilePathToFileEntries(_opts, scanPath, extractor, extractorOpts));
+                    }
+                }
+                else
+                {
+                    if (_opts.RespectGitIgnore)
+                    {
+                        if (IsGitPresent())
+                        {
+                            IEnumerable<string> files = Directory.EnumerateFiles(scanPath, "*.*", SearchOption.AllDirectories)
+                                .Where(fileName => !IsGitIgnored(fileName));
+                            foreach (string? notIgnoredFileName in files)
+                            {
+                                fileList.AddRange(FilePathToFileEntries(_opts, notIgnoredFileName, extractor, extractorOpts));
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogError("Could not detect git on path. Unable to use gitignore.");
+                            return (int)ExitCode.CriticalError;
+                        }
+                    }
+                    else
+                    {
+                        IEnumerable<string> files = Directory.EnumerateFiles(scanPath, "*.*", SearchOption.AllDirectories);
+                        foreach (string file in files)
+                        {
+                            fileList.AddRange(FilePathToFileEntries(_opts, file, extractor, extractorOpts));
+                        }
+                    }
+                }
+            }
+
+            var totalFiles = fileList.Count;
+
+            // Step 2: Load and verify rules
+            DevSkimRuleSet devSkimRuleSet;
+
+            if (!_opts.DisableProgress)
+            {
+                using (var ruleLoadingProgressBar = new ProgressBar(100, "Loading rules", progressBarOptions))
+                {
+                    // Load default or empty ruleset
+                    ruleLoadingProgressBar.Tick(10, "Loading default rules...");
+                    devSkimRuleSet = _opts.IgnoreDefaultRules ? new() : DevSkimRuleSet.GetDefaultRuleSet();
+                    int defaultRulesCount = devSkimRuleSet.Count();
+                    ruleLoadingProgressBar.Tick(30, $"Loaded {defaultRulesCount} default rules");
+                    
+                    // Load custom rules if provided
+                    if (_opts.Rules.Any())
+                    {
+                        int rulesProcessed = 0;
+                        int totalRulePaths = _opts.Rules.Count();
+                        
+                        foreach (string path in _opts.Rules)
+                        {
+                            devSkimRuleSet.AddPath(path);
+                            rulesProcessed++;
+                            int currentRulesCount = devSkimRuleSet.Count();
+                            int progress = 30 + (int)((double)rulesProcessed / totalRulePaths * 40);
+                            ruleLoadingProgressBar.Tick(progress, $"Loaded {rulesProcessed}/{totalRulePaths} custom rule paths ({currentRulesCount} total rules)");
+                        }
+                        ruleLoadingProgressBar.Tick(70, $"Loaded {devSkimRuleSet.Count()} total rules");
+                    }
+                    else
+                    {
+                        ruleLoadingProgressBar.Tick(70, $"Using {defaultRulesCount} rules");
+                    }
+                    
+                    // Apply rule ID filters
+                    if (_opts.RuleIds.Any())
+                    {
+                        ruleLoadingProgressBar.Tick(75, $"Filtering to {_opts.RuleIds.Count()} specific rule IDs...");
+                        devSkimRuleSet = devSkimRuleSet.WithIds(_opts.RuleIds);
+                    }
+
+                    if (_opts.IgnoreRuleIds.Any())
+                    {
+                        ruleLoadingProgressBar.Tick(77, $"Excluding {_opts.IgnoreRuleIds.Count()} rule IDs...");
+                        devSkimRuleSet = devSkimRuleSet.WithoutIds(_opts.IgnoreRuleIds);
+                    }
+                    
+                    // Verify rules
+                    ruleLoadingProgressBar.Tick(80, $"Verifying {devSkimRuleSet.Count()} rules...");
+                    DevSkimRuleVerifier devSkimVerifier = new DevSkimRuleVerifier(new DevSkimRuleVerifierOptions()
+                    {
+                        LanguageSpecs = devSkimLanguages,
+                        LoggerFactory = _logFactory
+                    });
+
+                    DevSkimRulesVerificationResult result = devSkimVerifier.Verify(devSkimRuleSet);
+
+                    if (!result.Verified)
+                    {
+                        _logger.LogError("Error: Rules failed validation. ");
+                        return (int)ExitCode.CriticalError;
+                    }
+
+                    ruleLoadingProgressBar.Tick(100, $"Loaded and verified {devSkimRuleSet.Count()} rules");
+                }
+            }
+            else
+            {
+                // No progress bar
+                devSkimRuleSet = _opts.IgnoreDefaultRules ? new() : DevSkimRuleSet.GetDefaultRuleSet();
+        
+                if (_opts.Rules.Any())
+                {
+                    foreach (string path in _opts.Rules)
+                    {
+                        devSkimRuleSet.AddPath(path);
+                    }
+                }
+
+                // Apply rule ID filters
+                if (_opts.RuleIds.Any())
+                {
+                    devSkimRuleSet = devSkimRuleSet.WithIds(_opts.RuleIds);
+                }
+
+                if (_opts.IgnoreRuleIds.Any())
+                {
+                    devSkimRuleSet = devSkimRuleSet.WithoutIds(_opts.IgnoreRuleIds);
+                }
+
                 DevSkimRuleVerifier devSkimVerifier = new DevSkimRuleVerifier(new DevSkimRuleVerifierOptions()
                 {
                     LanguageSpecs = devSkimLanguages,
@@ -335,16 +541,6 @@ namespace Microsoft.DevSkim.CLI.Commands
                     _logger.LogError("Error: Rules failed validation. ");
                     return (int)ExitCode.CriticalError;
                 }
-            }
-
-            if (_opts.RuleIds.Any())
-            {
-                devSkimRuleSet = devSkimRuleSet.WithIds(_opts.RuleIds);
-            }
-
-            if (_opts.IgnoreRuleIds.Any())
-            {
-                devSkimRuleSet = devSkimRuleSet.WithoutIds(_opts.IgnoreRuleIds);
             }
 
             if (!devSkimRuleSet.Any())
@@ -389,7 +585,9 @@ namespace Microsoft.DevSkim.CLI.Commands
             int filesSkipped = 0;
             int filesAffected = 0;
             int issuesCount = 0;
-            void parseFileEntry(FileEntry fileEntry)
+
+            // Step 3: Analyze files
+            void parseFileEntry(FileEntry fileEntry, IProgressBar? progressBar)
             {
                 devSkimLanguages.FromFileNameOut(fileEntry.Name, out LanguageInfo languageInfo);
 
@@ -414,9 +612,9 @@ namespace Microsoft.DevSkim.CLI.Commands
                     {
                         // Skip files we can't parse
                         Interlocked.Increment(ref filesSkipped);
+                        progressBar?.Tick($"Analyzed {filesAnalyzed + filesSkipped}/{totalFiles} files - Found {issuesCount} issues");
                         return;
                     }
-
 
                     List<Issue> issues = processor.Analyze(fileText, fileEntry.Name).ToList();
                     if (_opts is SerializedAnalyzeCommandOptions serializedAnalyzeCommandOptions)
@@ -428,7 +626,7 @@ namespace Microsoft.DevSkim.CLI.Commands
                             _logger.LogDebug($"Removed {numRemoved} results because of language rule filters.");
                         }
                     }
-                    // We need to make sure the issues are ordered by index, so when doing replacements we can keep a straight count of the offset caused by previous changes
+                    
                     issues.Sort((issue1, issue2) => issue1.Boundary.Index - issue2.Boundary.Index);
 
                     bool issuesFound = issues.Any(iss => !iss.IsSuppressionInfo) || _opts.DisableSuppression;
@@ -465,19 +663,43 @@ namespace Microsoft.DevSkim.CLI.Commands
                         }
                     }
                 }
+                
+                // Update progress bar
+                progressBar?.Tick($"Analyzed {filesAnalyzed + filesSkipped}/{totalFiles} files - Found {issuesCount} issues");
             }
 
-            //Iterate through all files
-            if (_opts.DisableParallel)
+            // Analyze files with progress bar
+            if (!_opts.DisableProgress && totalFiles > 0)
             {
-                foreach (FileEntry fileEntry in fileListing)
+                using (var fileAnalysisProgressBar = new ProgressBar(totalFiles, "Analyzing files", progressBarOptions))
                 {
-                    parseFileEntry(fileEntry);
+                    if (_opts.DisableParallel)
+                    {
+                        foreach (FileEntry fileEntry in fileList)
+                        {
+                            parseFileEntry(fileEntry, fileAnalysisProgressBar);
+                        }
+                    }
+                    else
+                    {
+                        Parallel.ForEach(fileList, fileEntry => parseFileEntry(fileEntry, fileAnalysisProgressBar));
+                    }
                 }
             }
             else
             {
-                Parallel.ForEach(fileListing, parseFileEntry);
+                // No progress bar
+                if (_opts.DisableParallel)
+                {
+                    foreach (FileEntry fileEntry in fileList)
+                    {
+                        parseFileEntry(fileEntry, null);
+                    }
+                }
+                else
+                {
+                    Parallel.ForEach(fileList, fileEntry => parseFileEntry(fileEntry, null));
+                }
             }
 
             outputWriter.FlushAndClose();
@@ -525,7 +747,7 @@ namespace Microsoft.DevSkim.CLI.Commands
         /// </summary>
         /// <param name="pathToFile"></param>
         /// <returns></returns>
-        private ICollection<FileEntry> FilenameToFileEntryArray(string pathToFile)
+        private ICollection<FileEntry> FilenameToFileEntryArray(String pathToFile)
         {
             try
             {
